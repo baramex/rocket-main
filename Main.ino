@@ -8,7 +8,7 @@ bool mpuStatus = false;
 MPU9250_WE mpu = MPU9250_WE(0x68);
 byte mpuSeq = 0;
 float verticalAcc[3];
-const float verticalAccThreshold = 4.0f / 5.0f;
+const float verticalAccThreshold = 4.0f;
 
 // BMP
 BMP280 bmp = BMP280(0x76);
