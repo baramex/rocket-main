@@ -3,25 +3,24 @@
 #include <Wire.h>
 #include <MPU9250_WE.h>
 
-// TODO: trigger ejection parachute/payload
-
 // MPU
 bool mpuStatus = false;
 MPU9250_WE mpu = MPU9250_WE(0x68);
 byte mpuSeq = 0;
 float verticalAcc[3];
-const float verticalAccThreshold = 5.0f;
+const float verticalAccThreshold = 4.0f / 5.0f;
 
 // BMP
 BMP280 bmp = BMP280(0x76);
-const unsigned pressure = 1013, updateDelay = 300;
+const unsigned pressure = 1013, updateDelay = 150, vSpeedDelay = 500;
 BMP280::eStatus_t bmpStatus = BMP280::eStatusErr;
-unsigned long lastStartAlt, apogeeTime, lastUpdate;
-float startAlt;
+unsigned long lastStartAlt, apogeeTime, lastUpdate, lastVspeed;
+float startAlt, apogeeHeight, lastAlt;
 byte bmpSeq = 0;
 byte speedSeq = 0;
 float altitude[3];
 float verticalSpeed[3] = { 0, 0, 0 };
+const float verticalSpeedThreshold = 5.0f, altitudeThreshold = 20.0f, altitudeDeltaMax = 50.0f;
 
 // SD Card
 const char filename[] = "main.csv";
@@ -31,7 +30,7 @@ const byte chipSelect = 10;
 bool sd = false;
 
 // LED
-const uint8_t ledPin = 2;
+const uint8_t ledPin = 4;
 unsigned long lastLedSeq;
 uint8_t ledSeq = 0;
 const unsigned fastBlink = 500, slowBlink = 1000;
@@ -49,21 +48,35 @@ State state = PREPARING;
 
 // Ejection
 const byte ejectionTries = 2;
-const unsigned ejectionDelay = 500;
+const unsigned ejectionDelay = 100, ejectionTryDelay = 500, delayBetweenEjection = 2000;
+const float criticalHeightLimit = 150.0f;  // Do not eject payload
+const float mediumHeightLimit = 300.0f;    // Eject payload lower than 300m
+const float nominalPayloadEjection = 300.0f;
+const float nominalMainEjection = 150.0f;
 enum EjectionState {
   WAITING,
-  EJECTING,
+  EJECTING_LOW,
+  EJECTING_HIGH,
   EJECTED
 };
 struct Ejection {
   EjectionState state = WAITING;
   unsigned long time;
-  byte tries;
+  byte tries = 0;
+  const byte pin;
+  Ejection(byte pin)
+    : pin(pin) {}
 };
-Ejection payload;
-Ejection mainParachute;
+Ejection payload(7);
+Ejection mainParachute(6);
 
 void setup() {
+  // Relay
+  pinMode(payload.pin, OUTPUT);
+  pinMode(mainParachute.pin, OUTPUT);
+  digitalWrite(payload.pin, HIGH);
+  digitalWrite(mainParachute.pin, HIGH);
+
   // Debug
   Serial.begin(9600);
 
@@ -84,10 +97,10 @@ void setup() {
   }
   if (bmpStatus == BMP280::eStatusOK) {
     bmp.setCtrlMeasMode(BMP280::eCtrlMeasModeNormal);
-    bmp.setCtrlMeasSamplingTemp(BMP280::eSampling_X2);
+    bmp.setCtrlMeasSamplingTemp(BMP280::eSampling_no);
     bmp.setCtrlMeasSamplingPress(BMP280::eSampling_X16);
     bmp.setConfigFilter(BMP280::eConfigFilter_X16);
-    bmp.setConfigTStandby(BMP280::eConfigTStandby_250);
+    bmp.setConfigTStandby(BMP280::eConfigTStandby_125);
     startAlt = initialiseAlt();
   }
 
@@ -114,6 +127,13 @@ void setup() {
 void loop() {
   const unsigned long now = millis();
 
+  if (payload.state == EJECTING_LOW || payload.state == EJECTING_HIGH) {
+    eject(payload, now);
+  }
+  if (mainParachute.state == EJECTING_LOW || mainParachute.state == EJECTING_HIGH) {
+    eject(mainParachute, now);
+  }
+
   if (sd) {
     const uint16_t chunkSize = file.availableForWrite();
     if (chunkSize && (dataBuffer.length() >= chunkSize || dataBuffer.length() >= 90)) {
@@ -121,10 +141,11 @@ void loop() {
     }
   }
 
-  if ((now - lastUpdate) >= updateDelay) {
-    state = READY;
+  if (now - lastUpdate >= updateDelay) {
+    if (state == PREPARING) state = READY;
     checkVerticalSpeed(now);
     checkAcceleration();
+    updateEjection(now);
     if (sd && (state == TAKINGOFF || state == DROPPING)) {
       dataBuffer += String(now) + "," + String(getMeanAltitude(), 1) + "," + String(getMeanVerticalAcc(), 1) + "\n";
     }
@@ -137,11 +158,13 @@ void loop() {
   }
 
   // Refresh base alt every 10 minutes
-  if ((state == PREPARING || state == READY) && (now - lastStartAlt) >= 1000 * 60 * 10) {
-    startAlt = getAltitude();
+  if ((state == PREPARING || state == READY) && now - lastStartAlt >= 1000 * 60 * 10) {
+    startAlt = getMeanAltitude();
 
     lastStartAlt = now;
   }
+
+  //Serial.println(state);
 }
 
 void updateLed() {
@@ -157,24 +180,30 @@ void updateLed() {
 
 float initialiseAlt() {
   delay(1000);
-  float lastAlt;
   for (uint8_t i = 0; i < 10; i++) {
-    const float currAlt = getAltitude();
-    addAltitudeSample(currAlt);
-    if (abs(lastAlt - currAlt) <= 1 && i >= 2) {
-      return currAlt;
+    const float alt = getAltitude();
+    addAltitudeSample(alt);
+    if (i >= 1) {
+      addVerticalSpeedSample((alt - lastAlt) / ((float)(millis() - lastVspeed) / 1000.0f));
+      lastAlt = alt;
     }
-    lastAlt = currAlt;
-    delay(500);
+    lastVspeed = millis();
+    if (i >= 3 && abs(lastAlt - getMeanAltitude()) <= 1.0f) {
+      return getMeanAltitude();
+    }
+    lastAlt = alt;
+    delay(100);
   }
   return lastAlt;
 }
 
 void initialiseAcc() {
   delay(1000);
-  for (uint8_t i = 0; i < 3; i++) {
-    addVerticalAccSample(mpu.getCorrectedAccRawValues().z);  // TO CHANGE according to vertical orientation of MPU on the rocket
-    delay(500);
+  for (uint8_t i = 0; i < 10; i++) {
+    addVerticalAccSample(mpu.getGValues().x);        // TO CHANGE according to vertical orientation of MPU on the rocket
+    if (i >= 2 && abs(getMeanVerticalAcc()) < 0.5f)  // TO CHECK if considerates g acceleration
+      return;
+    delay(100);
   }
 }
 
@@ -182,9 +211,11 @@ float getAltitude() {
   return 44330.0f * (1.0f - pow((float)bmp.getPressure() / 100.0f / pressure, 0.1903f));
 }
 
-void addAltitudeSample(const float& alt) {
+bool addAltitudeSample(const float& alt) {
+  if (altitude[(bmpSeq + 2) % 3] && abs(alt - altitude[(bmpSeq + 2) % 3]) > altitudeDeltaMax) return false;
   altitude[bmpSeq] = alt;
   bmpSeq = (bmpSeq + 1) % 3;
+  return true;
 }
 
 void addVerticalAccSample(const float& acc) {
@@ -210,32 +241,38 @@ float getMeanVerticalSpeed() {
 }
 
 void checkVerticalSpeed(const unsigned long& now) {
-  const float vz = (getAltitude() - altitude[(bmpSeq - 1) % 3]) / ((float)(now - lastUpdate) / 1000.0f);  // m/s
-  addVerticalSpeedSample(vz);
-  addAltitudeSample(getAltitude());
+  const float alt = getAltitude();
+  if (addAltitudeSample(alt) && now - lastVspeed >= vSpeedDelay) {
+    addVerticalSpeedSample((alt - lastAlt) / ((float)(now - lastVspeed) / 1000.0f));
+    lastAlt = alt;
+    lastVspeed = now;
+  }
+
+  /*Serial.print("Altitude: ");
+  Serial.println(getMeanAltitude());
+  Serial.print("Vertical Speed: ");
+  Serial.println(getMeanVerticalSpeed());*/
 
   if (state == READY || state == PREPARING) {
-    if (getMeanVerticalSpeed() > 5 || getMeanAltitude() - startAlt > 20) {
+    if (getMeanVerticalSpeed() >= verticalSpeedThreshold || getMeanAltitude() - startAlt >= altitudeThreshold) {
       state = TAKINGOFF;
-    }
-
-    if (getMeanVerticalSpeed() < -5) {
-      state = DROPPING;
     }
   }
 
   if (state == TAKINGOFF) {
-    if (getMeanVerticalSpeed() < -0.1) {
+    if (getMeanVerticalSpeed() <= 0.0f && getMeanAltitude() - startAlt >= altitudeThreshold) {
       state = DROPPING;
+      apogeeTime = now;
+      apogeeHeight = getMeanAltitude() - startAlt;
     }
   }
 }
 
 void checkAcceleration() {
-  addVerticalAccSample(mpu.getCorrectedAccRawValues().z);  // TO CHANGE according to vertical orientation of MPU on the rocket
+  addVerticalAccSample(mpu.getGValues().x);  // TO CHANGE according to vertical orientation of MPU on the rocket
 
   if (state == READY || state == PREPARING) {
-    if (getMeanVerticalAcc() >= verticalAccThreshold) {
+    if (abs(getMeanVerticalAcc()) >= verticalAccThreshold) {
       state = TAKINGOFF;
     }
   }
@@ -248,4 +285,44 @@ void saveToSD(uint16_t chunkSize) {
   file.write(dataBuffer.c_str(), chunkSize);
   file.flush();
   dataBuffer.remove(0, chunkSize);
+}
+
+void updateEjection(const unsigned long& now) {
+  if (state == DROPPING) {
+    if (now - apogeeTime < delayBetweenEjection) return;
+
+    if (payload.state == WAITING && apogeeHeight > criticalHeightLimit) {
+      if (apogeeHeight <= mediumHeightLimit) {
+        eject(payload, now);
+      } else if (getMeanAltitude() - startAlt <= nominalPayloadEjection) {
+        eject(payload, now);
+      }
+    }
+
+    if (mainParachute.state == WAITING) {
+      if (apogeeHeight <= criticalHeightLimit) {
+        eject(mainParachute, now);
+      } else if (getMeanAltitude() - startAlt <= nominalMainEjection) {
+        if (now - payload.time >= delayBetweenEjection) eject(mainParachute, now);
+      }
+    }
+  }
+}
+
+bool eject(Ejection& eject, const unsigned long& now) {
+  if (eject.state == EJECTED) return false;
+  if (eject.state == EJECTING_HIGH && now - eject.time < ejectionDelay) return false;
+  if (eject.state == EJECTING_LOW && now - eject.time < ejectionTryDelay) return false;
+
+  if (eject.state == WAITING || eject.state == EJECTING_HIGH) {
+    eject.state = EJECTING_LOW;
+    digitalWrite(eject.pin, LOW);
+    eject.tries++;
+    eject.time = now;
+  } else {
+    if (eject.tries >= ejectionTries) eject.state = EJECTED;
+    else eject.state = EJECTING_HIGH;
+    digitalWrite(eject.pin, HIGH);
+  }
+  return true;
 }
