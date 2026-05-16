@@ -147,7 +147,7 @@ void loop() {
     checkAcceleration();
     updateEjection(now);
     if (sd && (state == TAKINGOFF || state == DROPPING)) {
-      dataBuffer += String(now) + "," + String(getMeanAltitude(), 1) + "," + String(getMeanVerticalAcc(), 1) + "\n";
+      dataBuffer += String(now) + "," + String(getMeanAltitude(), 1) + "," + String(getMeanVerticalAcc(), 1) + "," + String(payload.state) + "," + String(mainParachute.state) + "\n";
     }
     lastUpdate = now;
   }
